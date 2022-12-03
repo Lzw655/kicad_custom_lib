@@ -1,0 +1,14 @@
+{
+  "MultiLineText": "ZDYZ_7''_RGB",
+  "HeightCtrl": "10",
+  "FontComboBox": "mplus-1mn-medium",
+  "LayerComboBox": "F.SilkS",
+  "CapLeftChoice": "[",
+  "CapRightChoice": "]",
+  "PaddingTopCtrl": "5",
+  "PaddingLeftCtrl": "5",
+  "PaddingRightCtrl": "5",
+  "PaddingBottomCtrl": "5",
+  "WidthCtrl": "30",
+  "AlignmentChoice": "Center"
+}

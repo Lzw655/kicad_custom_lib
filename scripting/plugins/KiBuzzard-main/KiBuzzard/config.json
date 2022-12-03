@@ -1,0 +1,13 @@
+{
+  "MultiLineText": "aa",
+  "HeightCtrl": "2",
+  "FontComboBox": "Roboto",
+  "CapLeftChoice": "[",
+  "CapRightChoice": "]",
+  "PaddingTopCtrl": "5",
+  "PaddingLeftCtrl": "5",
+  "PaddingRightCtrl": "5",
+  "PaddingBottomCtrl": "5",
+  "WidthCtrl": "2",
+  "AlignmentChoice": "Center"
+}
