@@ -11,6 +11,7 @@ from enum import Enum
 from ntpath import join
 from pathlib import Path
 from threading import Thread
+import zipfile
 
 import requests
 import wx
@@ -33,6 +34,7 @@ class LibraryState(Enum):
 class Library:
     """A storage class to get data from a sqlite database and write it back"""
 
+    # no longer works
     CSV_URL = "https://jlcpcb.com/componentSearch/uploadComponentInfo"
 
     def __init__(self, parent):
@@ -219,12 +221,13 @@ class Library:
         """get all corrections from the database."""
         with contextlib.closing(sqlite3.connect(self.dbfile)) as con:
             with con as cur:
-                return [
-                    list(c)
-                    for c in cur.execute(
+                try:
+                    result = cur.execute(
                         f"SELECT * FROM rotation ORDER BY regex ASC"
                     ).fetchall()
-                ]
+                    return [list(c) for c in result]
+                except sqlite3.OperationalError:
+                    return []
 
     def create_mapping_table(self):
         """Create the mapping table."""
@@ -315,9 +318,16 @@ class Library:
         with contextlib.closing(sqlite3.connect(self.dbfile)) as con:
             with con as cur:
                 numbers = ",".join([f'"{n}"' for n in lcsc])
-                return cur.execute(
-                    f'SELECT "LCSC Part", "Stock", "Library Type" FROM parts where "LCSC Part" IN ({numbers})'
-                ).fetchall()
+
+                try:
+                    return cur.execute(
+                        f'SELECT "LCSC Part", "Stock", "Library Type" FROM parts where "LCSC Part" IN ({numbers})'
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    # parts tabble doesn't exist. can indicate our database is corrupt or we weren't able
+                    # to populate from the URL.
+                    # act like we returned nothing then.
+                    return []
 
     def update(self):
         """Update the sqlite parts database from the JLCPCB CSV."""
@@ -328,69 +338,89 @@ class Library:
         self.state = LibraryState.DOWNLOAD_RUNNING
         start = time.time()
         wx.PostEvent(self.parent, ResetGaugeEvent())
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36",
-        }
-        r = requests.get(
-            self.CSV_URL, allow_redirects=True, stream=True, headers=headers
-        )
-        if r.status_code != requests.codes.ok:
+        # Download the zipped parts database
+        fallback_url = "https://jlc.bouni.de/parts.zip"
+        with open(os.path.join(self.datadir, "parts.zip"), "wb") as f:
+            try:
+                r = requests.get(fallback_url, allow_redirects=True, stream=True)
+                if r.status_code != requests.codes.ok:
+                    wx.PostEvent(
+                        self.parent,
+                        MessageEvent(
+                            title="Download Error",
+                            text=f"Failed to download the JLCPCB database, error code {r.status_code}\n"
+                            + "URL was:\n"
+                            f"'{fallback_url}'",
+                            style="error",
+                        ),
+                    )
+                    self.state = LibraryState.INITIALIZED
+                    self.create_tables(["placeholder_invalid_column_fix_errors"])
+                    return
+
+                size = int(r.headers.get("Content-Length"))
+                self.logger.debug(
+                    f"Download parts db with a size of {(size / 1024 / 1024):.2f}MB"
+                )
+                for data in r.iter_content(chunk_size=4096):
+                    f.write(data)
+                    progress = f.tell() / size * 100
+                    wx.PostEvent(self.parent, UpdateGaugeEvent(value=progress))
+            except Exception as e:
+                wx.PostEvent(
+                    self.parent,
+                    MessageEvent(
+                        title="Download Error",
+                        text=f"Failed to download the JLCPCB database, {e}",
+                        style="error",
+                    ),
+                )
+                self.state = LibraryState.INITIALIZED
+                self.create_tables(["placeholder_invalid_column_fix_errors"])
+                return
+        # rename existing parts.db to parts.db.bak, delete already existing bak file if neccesary
+        if os.path.exists(self.dbfile):
+            if os.path.exists(f"{self.dbfile}.bak"):
+                os.remove(f"{self.dbfile}.bak")
+            os.rename(self.dbfile, f"{self.dbfile}.bak")
+        # unzip downloaded parts.zip
+        with zipfile.ZipFile(os.path.join(self.datadir, "parts.zip"), "r") as z:
+            z.extractall(self.datadir)
+        # check if dbfile was successfully extracted
+        if not os.path.exists(self.dbfile):
+            if os.path.exists(f"{self.dbfile}.bak"):
+                os.rename(f"{self.dbfile}.bak", self.dbfile)
+                wx.PostEvent(
+                    self.parent,
+                    MessageEvent(
+                        title="Download Error",
+                        text=f"Failed to download the JLCPCB database, db was not extracted from zip",
+                        style="error",
+                    ),
+                )
+                self.state = LibraryState.INITIALIZED
+                self.create_tables(["placeholder_invalid_column_fix_errors"])
+                return
+        else:
+            wx.PostEvent(self.parent, ResetGaugeEvent())
+            end = time.time()
+            wx.PostEvent(self.parent, PopulateFootprintListEvent())
             wx.PostEvent(
                 self.parent,
                 MessageEvent(
-                    title="Download Error",
-                    text=f"Failed to download the JLCPCB database CSV, error code {r.status_code}",
-                    style="error",
+                    title="Success",
+                    text=f"Successfully downloaded and imported the JLCPCB database in {end-start:.2f} seconds!",
+                    style="info",
                 ),
             )
-            return
-        size = int(r.headers.get("Content-Length"))
-        filename = r.headers.get("Content-Disposition").split("=")[1]
-        date = "unknown"
-        _date = re.search(r"(\d{4})(\d{2})(\d{2})", filename)
-        if _date:
-            date = f"{_date.group(1)}-{_date.group(2)}-{_date.group(3)}"
-        self.logger.debug(
-            f"Download {filename} with a size of {(size / 1024 / 1024):.2f}MB"
-        )
-        csv_reader = csv.reader(map(lambda x: x.decode("gbk"), r.raw))
-        headers = next(csv_reader)
+            self.state = LibraryState.INITIALIZED
+
+    def create_tables(self, headers):
         self.create_meta_table()
         self.delete_parts_table()
         self.create_parts_table(headers)
         self.create_rotation_table()
         self.create_mapping_table()
-        buffer = []
-        part_count = 0
-        with contextlib.closing(sqlite3.connect(self.dbfile)) as con:
-            cols = ",".join(["?"] * len(headers))
-            query = f"INSERT INTO parts VALUES ({cols})"
-
-            for count, row in enumerate(csv_reader):
-                row.pop()
-                buffer.append(row)
-                if count % 1000 == 0:
-                    progress = r.raw.tell() / size * 100
-                    wx.PostEvent(self.parent, UpdateGaugeEvent(value=progress))
-                    con.executemany(query, buffer)
-                    buffer = []
-                part_count = count
-            if buffer:
-                con.executemany(query, buffer)
-            con.commit()
-        self.update_meta_data(filename, size, part_count, date, dt.now().isoformat())
-        wx.PostEvent(self.parent, ResetGaugeEvent())
-        end = time.time()
-        wx.PostEvent(self.parent, PopulateFootprintListEvent())
-        wx.PostEvent(
-            self.parent,
-            MessageEvent(
-                title="Success",
-                text=f"Successfully downloaded and imported the JLCPCB database in {end-start:.2f} seconds!",
-                style="info",
-            ),
-        )
-        self.state = LibraryState.INITIALIZED
 
     @property
     def categories(self):
